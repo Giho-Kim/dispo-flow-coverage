@@ -1,8 +1,8 @@
 # DiSPO structure with flow matching
 
-Both the outcome model and conditional action readout are flow matching models. The architecture is a NumPy port of the conditional linear U-Net in `dispo_official/models/nets.py`: sinusoidal time embedding, condition embedding, LayerNorm/Swish, FiLM residual blocks, down/middle/up paths, and skip concatenation. Default embedding width is 256 and down widths are 256/512/1024.
+Both the outcome model and conditional action readout are flow matching models. The PyTorch implementation follows the conditional linear U-Net in `dispo_official/models/nets.py`: sinusoidal time embedding, condition embedding, LayerNorm/Swish, FiLM residual blocks, down/middle/up paths, and skip concatenation. Default embedding width is 256 and down widths are 256/512/1024.
 
-The reference is WEIRDLabUW/dispo commit `03abef45836b1c238ff90b5b8e93132d3dc41e91`. Its retrieved source files are retained unchanged in `dispo_official/`. The NumPy port uses Gaussian fan-in initialization and float64; it is not a numerically identical Flax implementation.
+The reference is WEIRDLabUW/dispo commit `03abef45836b1c238ff90b5b8e93132d3dc41e91`. Its retrieved source files are retained unchanged in `dispo_official/`. The PyTorch implementation uses Gaussian fan-in initialization. CUDA uses float32 parameters and TF32 matrix products in the command-line tools. CPU computation uses float64.
 
 ## Updates
 
@@ -17,7 +17,9 @@ The exact same y is the outcome training target and the outcome condition for re
     x_t = (1-t) z + t x_data
     loss = mean ||v(x_t,t,condition) - (x_data-z)||^2
 
-Outcome condition is s; readout condition is concatenated (s,y). Physical outcome bounds are feature_min/(1-gamma) and feature_max/(1-gamma). Targets are affinely mapped to [-1,1] for flow training. Generated endpoints are clipped in normalized coordinates and mapped back. The Heun ODE solver uses 24 steps by default. This endpoint clipping is the FM adaptation of the reference sampler's bounded denoised prediction; it does not enforce an occupancy sum or Bellman flow constraint.
+Outcome condition is s; readout condition is concatenated (s,y). Physical outcome bounds are feature_min/(1-gamma) and feature_max/(1-gamma). Targets are affinely mapped to [-1,1] for flow training. Generated endpoints are clipped in normalized coordinates and mapped back. The ODE solver uses Euler with 10 steps by default. This endpoint clipping is the FM adaptation of the reference sampler's bounded denoised prediction; it does not enforce an occupancy sum or Bellman flow constraint.
+
+For nonterminating Garnet with state or state-action one-hot features, outcome generation instead projects the normalized endpoint onto the probability simplex before multiplying by `1/(1-gamma)`. Generated outcomes are nonnegative and sum to `1/(1-gamma)` (100 at gamma=0.99). This applies to bootstrap, collection, and evaluation. Continuous outcomes and readout actions use coordinate clipping. The checkpoint config records `outcome_simplex`; older Garnet checkpoints without this field enable it when loaded. Projection enforces the total occupancy constraint, while feasibility under the transition dynamics remains a separate question. Evaluation summaries record whether this projection was used, so curves spanning its introduction should be interpreted as a change in the sampling procedure.
 
 Both models have EMA rate 0.995. EMA models produce bootstrap outcomes, candidate outcomes, and readout actions. AdamW uses lr 3e-4, wd 1e-6, 500-step warmup, and cosine decay over a fixed 100000-update schedule. Global gradient norm is capped at 1. The reference helper rescales every gradient to norm 1; this port caps it to avoid amplifying vanishing gradients.
 
@@ -31,24 +33,36 @@ At every evaluation visit, sample 1000 outcome candidates, rank by reward dot ou
 
 The Garnet evaluator estimates this resampling policy with 128 independent outcome-bank/action-generation draws per state and reward. It solves the resulting stochastic Markov reward process for normalized return. All randomness in outcome and action generation is included before the solve. Rewards use the same feature type as training.
 
-Coverage collection samples candidate outcomes at each visited state, weights candidates by `(1 + m^T G(s)^-1 m)^tilt`, generates an action, and appends the observed transition. Uniform collection chooses an outcome uniformly. Both retain epsilon=0.1 random-action exploration. G is estimated from an independent bank of current EMA outcome samples plus ridge; coverage is an added acquisition rule rather than part of the original DiSPO objective.
+During Garnet training, evaluation runs after the checkpoint every five rounds and at the final round. The trainer logs `eval_start` and `eval_done`, and writes `summary.json` and `evaluation.npz` under `evaluation/roundNNN/` in the run directory. Use `--eval-every N` to change the interval or `--eval-every 0` to disable automatic evaluation. Use `--eval-banks` and `--eval-tasks` to change the evaluation budget, which defaults to 128 each. These settings are saved in training checkpoints. The continuous environment uses the training-only smoke-test path.
+
+After the initial random-action collection, both methods draw one random outcome from the EMA model conditioned on the current state and pass it to the readout. Both retain epsilon=0.1 random-action exploration.
+
+Online collection defaults to rounds 5, 10, 15, and so on, with 1,024 environment steps per collection round. Training updates run every round using the accumulated replay. Use `--collect-every N` to change the interval. Resume inherits the saved interval and uses 5 for older checkpoints without an interval.
+
+On Garnet, `--method coverage` weights only the readout flow-matching loss; the outcome loss remains uniform, including during pretraining. Joint features are `z = e_s ⊗ [1, y]`, using one-hot state and detached Bellman outcome. The unregularized Gram is an EMA of full-batch mean outer products (default decay 0.995), initialized from the first coverage batch. Ridge is added only when computing leverage `l = z^T (G + ridge I)^-1 z`. Default linear weights are `0.9 * l / sum(l) + 0.1 / batch_size`; `--uniform-mix`, `--coverage-weighting`, and `--gram-ema-rate` configure this. State blocks share the full batch denominator, preserving state-frequency information. Gram EMA and configuration are saved and restored with checkpoints; checkpoints without a Gram initialize it on the first coverage update. Legacy checkpoints preserve their saved weighting mode and mixture unless explicitly overridden. `--method uniform` and the continuous smoke environment use uniform losses. Restart running trainers to apply code changes.
 
 ## Environments and checkpoints
 
 Default Garnet: 6 states, 2 actions, deterministic branching=1, state one-hot features, gamma=0.99, fixed reset state 0. `--branching 2` explicitly selects stochastic dynamics; `--features state-action` selects state-action features. The continuous smoke environment uses state features (x,x^2) with specified feature bounds.
 
-Checkpoint schema is `dispo-fm-unet-v2`. Checkpoints include both online networks, both EMA networks, both Adam moment states/counters, replay, RNG, round, interaction count, and run settings. Every five rounds and the final round are retained, with atomic checkpoint replacement and an exclusive writer lock. Earlier v1 checkpoints remain historical and cannot resume the new architecture.
+Checkpoint schema is `dispo-fm-unet-v3`. Checkpoints include both online networks, EMA weights, AdamW moments and counters, replay, NumPy and PyTorch RNG state, and run settings. The trainer atomically writes an uncompressed `checkpoint.npz` every round and retains snapshots every five rounds and at the final round under an exclusive writer lock. Existing v2 NumPy checkpoints load with their weights, optimizer state, and replay. A v2 resume or a CPU/CUDA switch starts a new model sampling stream because the random number generators differ.
+
+The simulator and replay buffer run on CPU. CUDA keeps the sampled training batch, ODE integration, outcome selection, and readout on the device. The sampler reuses the context embedding along the integration grid and captures CUDA Graphs for the fixed-shape bootstrap and collection calls. Garnet evaluation ranks outcomes in batches on the device and solves the resulting small Markov reward processes on CPU.
 
 From the project root:
 
 ```bash
-OPENBLAS_NUM_THREADS=1 python shared_readout/run.py train --output shared_readout/fm_v2_results/coverage --method coverage --rounds 100
-OPENBLAS_NUM_THREADS=1 python shared_readout/run.py train --output shared_readout/fm_v2_results/uniform --method uniform --rounds 100
-OPENBLAS_NUM_THREADS=1 python shared_readout/run.py train --output shared_readout/fm_v2_results/coverage --resume shared_readout/fm_v2_results/coverage/checkpoint.npz --rounds 120
-OPENBLAS_NUM_THREADS=1 python -m shared_readout.dispo_fm.evaluate shared_readout/fm_v2_results/coverage/checkpoint.npz --output shared_readout/fm_v2_results/coverage/evaluation
-OPENBLAS_NUM_THREADS=1 python -m unittest shared_readout.dispo_fm.test_core -v
+conda env create -f environment.yml
+conda activate dispo-fm-gpu
+python shared_readout/run.py train --device cuda --output shared_readout/fm_v3_results/coverage --method coverage --rounds 100
+python shared_readout/run.py train --device cuda --output shared_readout/fm_v3_results/uniform --method uniform --rounds 100
+python shared_readout/run.py train --device cuda --output shared_readout/fm_v3_results/coverage --resume shared_readout/fm_v3_results/coverage/checkpoint.npz --rounds 120
+python -m shared_readout.dispo_fm.evaluate shared_readout/fm_v3_results/coverage/checkpoint.npz --device cuda --output shared_readout/fm_v3_results/coverage/evaluation
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python -m unittest shared_readout.dispo_fm.test_core -v
 ```
 
-Only NumPy is required for training and evaluation. `--tiny` explicitly selects a small 8/16/32 network for smoke tests. It is not the default experiment configuration.
+Training and evaluation default to `--device auto`. Use `--device cpu` to run on CPU or `--device cuda:N` to select a visible GPU. `--tiny` selects an 8/16/32 network for smoke tests. The default network uses 256/512/1024 channels and batch size 2048.
 
-Validation: finite-difference gradients across condition embedding, FiLM, LayerNorm, skip connections and output; outcome scaling and terminal targets; learning of both models; both EMA paths; exact saved/resumed updates and generation; continuous action bounds; elite averaging and EMA-only inference. Short deterministic Garnet training/resume/evaluation and continuous training passed. No long performance run has been executed with v2.
+The default sampler is Euler with 10 steps for both outcome and readout generation. Training saves the solver and step count in the checkpoint. Legacy checkpoints with the old implicit Heun 24 default adopt Euler 10 when loaded. Explicit saved solver settings and custom legacy Heun step counts are preserved. Use `--ode-solver` and `--ode-steps` to override the sampler in training, resume, or standalone evaluation. Evaluation summaries record the solver and step count used.
+
+The tests check finite-difference gradients, outcome bounds and terminal targets, the shared Bellman target, both models and EMA paths, exact checkpoint continuation on the same backend, continuous action bounds, and elite selection.

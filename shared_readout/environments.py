@@ -13,6 +13,34 @@ class Garnet:
         self._state=int(self._rng.choice(self.states,p=self._p[self._state,int(action)]))
         return np.eye(self.states)[self._state],0.,False,False,{}
 
+def fourrooms_cells():
+    doors = {(2, 5), (8, 5), (5, 2), (5, 8)}
+    return [(row, col) for row in range(11) for col in range(11)
+            if (row != 5 and col != 5) or (row, col) in doors]
+
+
+FOURROOMS_GOALS = ((0, 10), (10, 0), (10, 10))
+
+
+def fourrooms_rbf_features():
+    cells = np.asarray(fourrooms_cells())
+    delta = cells[:, None] - cells[None, :]
+    return np.exp(-np.square(delta).sum(axis=2) / (2 * 2.0 ** 2))
+
+
+def fourrooms_transitions():
+    """An 11×11 grid with a cross wall and four doorways."""
+    cells = fourrooms_cells()
+    index = {cell: i for i, cell in enumerate(cells)}
+    moves = ((-1, 0), (0, 1), (1, 0), (0, -1))
+    transitions = np.zeros((len(cells), len(moves), len(cells)))
+    for state, (row, col) in enumerate(cells):
+        for action, (dy, dx) in enumerate(moves):
+            successor = index.get((row + dy, col + dx), state)
+            transitions[state, action, successor] = 1.
+    return transitions
+
+
 class ContinuousSystem:
     """Bounded continuous state/action smoke-test environment."""
     def reset_to(self,context,seed=0):
@@ -45,6 +73,16 @@ def make_experiment(name,seed=0,teacher_count=16,branching=2):
         return dict(env_factory=lambda:Garnet(p),feature=lambda obs,action:np.eye(s*a)[int(np.argmax(obs))*a+int(action)],
                     feature_dim=s*a,space=ActionSpace('discrete',n=a),contexts=list(range(s)),
                     anchors=np.eye(s),weights=np.full(s,1/s),teachers=teachers)
+    if name == 'fourrooms':
+        p = fourrooms_transitions()
+        states, actions = p.shape[:2]
+        anchors = np.eye(states)
+        features = np.eye(states * actions)
+        return dict(env_factory=lambda: Garnet(p),
+                    feature=lambda obs, action: features[obs.argmax() * actions + int(action)].copy(),
+                    feature_dim=states * actions, space=ActionSpace('discrete', n=actions),
+                    contexts=list(range(states)), anchors=anchors,
+                    weights=np.full(states, 1 / states), teachers=[])
     if name=='continuous':
         teachers=[]
         for _ in range(teacher_count):
