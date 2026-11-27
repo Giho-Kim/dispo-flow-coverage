@@ -66,3 +66,40 @@ Training and evaluation default to `--device auto`. Use `--device cpu` to run on
 The default sampler is Euler with 10 steps for both outcome and readout generation. Training saves the solver and step count in the checkpoint. Legacy checkpoints with the old implicit Heun 24 default adopt Euler 10 when loaded. Explicit saved solver settings and custom legacy Heun step counts are preserved. Use `--ode-solver` and `--ode-steps` to override the sampler in training, resume, or standalone evaluation. Evaluation summaries record the solver and step count used.
 
 The tests check finite-difference gradients, outcome bounds and terminal targets, the shared Bellman target, both models and EMA paths, exact checkpoint continuation on the same backend, continuous action bounds, and elite selection.
+Training logs to Weights & Biases by default. Run `wandb login` once on the training machine and use `--wandb-project` or `WANDB_PROJECT` to choose the project (default: `dispo-fm`). Each run logs training and evaluation metrics and publishes the round 0 checkpoint and every 100th round as checkpoint artifacts. `--save-every` controls additional local snapshots. Use `--wandb-mode offline` to queue logs locally or `--wandb-mode disabled` to train without W&B.
+
+## OCBench Block Lite on GPU
+
+From the repository root, create a separate environment from the GPU environment above.
+
+```bash
+conda create -n dispo-ocbench --clone dispo-fm-gpu
+conda activate dispo-ocbench
+python -m pip install 'ocbench[mjwarp]==1.0.2'
+```
+
+For Linux x86-64 with a CUDA 12 driver, install the CUDA 12 build of Warp. This
+was verified on an RTX 3090 with driver 560.35.03.
+
+```bash
+python -m pip install --force-reinstall --no-deps \
+  'https://github.com/NVIDIA/warp/releases/download/v1.19.0/warp_lang-1.19.0+cu12-py3-none-manylinux_2_28_x86_64.whl'
+```
+
+The command below trains on CUDA and runs five parallel MJWarp evaluation episodes
+on the same GPU. Expect a kernel compilation delay at the first rollout.
+The loader downloads the first official training shard by default
+(`--ocbench-shards` selects more). Task planning uses bounded state features plus
+the transition reward. OCBench supports uniform training and reports mean return
+and success rate. A task ID with `-cpu-` selects CPU MuJoCo for rollouts.
+
+```bash
+wandb login
+MUJOCO_GL=egl python shared_readout/run.py train --environment ocbench \
+  --ocbench-task block-lite-double-task2-v0 --device cuda \
+  --output shared_readout/fm_v3_results/ocbench_block_double_uniform \
+  --batch-size 256 --pretrain-updates 0 --rounds 100 \
+  --candidates 128 --eval-tasks 5 --eval-every 10 --save-every 100
+```
+
+Use `--wandb-mode disabled` if you do not want to upload logs and checkpoints.

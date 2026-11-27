@@ -1,5 +1,6 @@
 """Train/resume the transition-based flow implementation."""
 import argparse
+from dataclasses import asdict
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import torch
 from tqdm import tqdm
 from .core import Config, Learner, resolve_device
 from .evaluate import DEFAULT_BANKS, DEFAULT_TASKS, evaluate_learner, save_evaluation
+from .ocbench_adapter import DEFAULT_TASK as DEFAULT_OCBENCH_TASK
 
 
 def save_round(learner, output, spec, snapshot=False):
@@ -26,7 +28,16 @@ def save_round(learner, output, spec, snapshot=False):
         os.replace(temporary, destination)
 
 
-def evaluate_round(learner, output, spec, final_round, *, skip_completed=False):
+WANDB_CHECKPOINT_EVERY = 100
+
+
+def upload_checkpoint(run, output, current):
+    path = output / f'round{current:03d}.npz'
+    run.log_artifact(str(path), name=f'checkpoint-{run.id}', type='checkpoint',
+                     aliases=['latest', f'round-{current}'])
+
+
+def evaluate_round(learner, output, spec, final_round, *, skip_completed=False, run=None):
     every = spec['eval_every']
     current = learner.round
     if not every or spec['environment'] == 'continuous':
@@ -37,24 +48,33 @@ def evaluate_round(learner, output, spec, final_round, *, skip_completed=False):
     if skip_completed and all((destination / name).is_file() for name in ('summary.json', 'evaluation.npz')):
         return
     banks, tasks, candidates = spec['eval_banks'], spec['eval_tasks'], learner.config.candidates
-    details = (dict(horizon=spec['episode_steps']) if spec['environment'] == 'fourrooms' else dict(banks=banks))
+    details = (dict(horizon=spec['episode_steps']) if spec['environment'] in ('fourrooms', 'ocbench') else dict(banks=banks))
     print(json.dumps(dict(event='eval_start', round=current, tasks=tasks, candidates=candidates, **details)), flush=True)
     row, arrays = evaluate_learner(learner, spec, banks=banks, candidates=candidates, tasks=tasks)
     summary = save_evaluation(destination, row, arrays, banks=banks, candidates=candidates, tasks=tasks, config=learner.config)
     print(json.dumps(dict(event='eval_done', **summary)), flush=True)
+    if run is not None:
+        run.log({'round': current, **{f'eval/{key}': row[key]
+                                     for key in ('mean_return', 'mean_regret', 'mean_oracle', 'success_rate')
+                                     if key in row}})
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['train', 'validate'])
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--wandb-project', default=os.environ.get('WANDB_PROJECT', 'dispo-fm'))
+    parser.add_argument('--wandb-mode', choices=['online', 'offline', 'disabled'],
+                        default=os.environ.get('WANDB_MODE', 'online'))
     parser.add_argument('--resume', type=Path)
-    parser.add_argument('--offline-data', type=Path, help='Fixed discrete replay dataset; disables online collection')
-    parser.add_argument('--environment', choices=['garnet', 'fourrooms', 'continuous'], default='garnet')
+    parser.add_argument('--offline-data', type=Path, help='Local offline replay dataset; disables online collection')
+    parser.add_argument('--environment', choices=['garnet', 'fourrooms', 'continuous', 'ocbench'], default='garnet')
+    parser.add_argument('--ocbench-task', default=DEFAULT_OCBENCH_TASK)
+    parser.add_argument('--ocbench-shards', type=int, default=1)
     parser.add_argument('--branching', type=int, choices=[1, 2], default=1)
     parser.add_argument('--features',choices=['state','state-action','rbf'],default='state')
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--method', choices=['coverage', 'uniform'], default='coverage',
+    parser.add_argument('--method', choices=['coverage', 'uniform'],
                         help='Coverage-weighted or uniform training on Garnet')
     parser.add_argument('--tilt', type=float, help=f'Coverage weighting exponent (default: {Config.tilt}; resume preserves saved value)')
     parser.add_argument('--uniform-mix', type=float, help=f'Uniform fraction of coverage training weights (default: {Config.uniform_mix}; resume preserves saved value)')
@@ -67,25 +87,36 @@ def main():
     parser.add_argument('--steps-per-round', type=int, default=1024, help='Environment steps per collection round')
     parser.add_argument('--collect-every', type=int, help='Rounds between online collections (default: 5)')
     parser.add_argument('--updates-per-round', type=int, default=128)
-    parser.add_argument('--episode-steps', type=int, default=64)
+    parser.add_argument('--episode-steps', type=int)
     parser.add_argument('--batch-size', type=int, default=2048)
     parser.add_argument('--ode-steps', type=int, help=f'ODE steps (default: {Config.ode_steps})')
     parser.add_argument('--ode-solver', choices=['heun', 'euler'], help=f'ODE solver (default: {Config.ode_solver})')
     parser.add_argument('--candidates', type=int, default=1000)
+    parser.add_argument('--save-every', type=int, help='Rounds between checkpoint snapshots (default: 5; 0 keeps only initial and final snapshots)')
     parser.add_argument('--eval-every', type=int, help='Garnet rounds between evaluations (default: 5, 0 disables)')
     parser.add_argument('--eval-banks', type=int, help=f'Banks per state for Garnet evaluation (default: {DEFAULT_BANKS})')
     parser.add_argument('--eval-tasks', type=int, help=f'Garnet evaluation reward tasks (default: {DEFAULT_TASKS})')
     parser.add_argument('--device', default='auto', help='auto, cpu, cuda, or cuda:N')
     parser.add_argument('--tiny', action='store_true', help='Small network for smoke tests only')
     args = parser.parse_args()
+    if args.method is None:
+        args.method = 'uniform' if args.environment == 'ocbench' else 'coverage'
+    if not args.resume and args.environment == 'ocbench':
+        if args.method != 'uniform' or args.features != 'state':
+            parser.error('OCBench currently requires --method uniform --features state')
+        if args.ocbench_shards < 1:
+            parser.error('--ocbench-shards must be positive')
+
     if not args.resume and args.features == 'rbf' and args.environment != 'fourrooms':
         parser.error('--features rbf requires Four Rooms')
     if args.resume and args.offline_data:
         parser.error('Resume restores its replay; use --offline-data for a new run')
+    if args.episode_steps is None and args.environment != 'ocbench':
+        args.episode_steps = 64
     for key in ('rounds', 'initial_steps', 'pretrain_updates', 'steps_per_round', 'updates_per_round', 'episode_steps'):
-        if getattr(args, key) < (0 if key in ('rounds', 'pretrain_updates') else 1):
+        if getattr(args, key) is not None and getattr(args, key) < (0 if key in ('rounds', 'pretrain_updates') else 1):
             parser.error(f'Invalid {key}')
-    for key, minimum in (('collect_every', 1), ('eval_every', 0), ('eval_banks', 1), ('eval_tasks', 1)):
+    for key, minimum in (('collect_every', 1), ('eval_every', 0), ('save_every', 0), ('eval_banks', 1), ('eval_tasks', 1)):
         value = getattr(args, key)
         if value is not None and value < minimum:
             parser.error(f'Invalid {key}')
@@ -117,6 +148,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     lock = args.output/'run.lock'
     with lock.open('x'):
+        run = None
         try:
             if args.resume:
                 learner, spec = Learner.load(args.resume, device)
@@ -139,11 +171,32 @@ def main():
                     parser.error('Checkpoint exists; use --resume')
                 spec = {k: getattr(args, k) for k in ('environment', 'branching', 'features', 'seed', 'method', 'initial_steps',
                         'pretrain_updates', 'steps_per_round', 'updates_per_round', 'episode_steps')}
-                continuous = args.environment == 'continuous'
-                experiment = make_experiment(args.environment, args.seed, teacher_count=0, branching=args.branching)
-                obs_dim = experiment['anchors'].shape[1]
-                fdim = obs_dim if args.features in ('state', 'rbf') else experiment['feature_dim']
-                actions = 2 if continuous else experiment['space'].n
+                ocbench = args.environment == 'ocbench'
+                continuous = args.environment in ('continuous', 'ocbench')
+                action_bounds = {}
+                if ocbench:
+                    from .ocbench_adapter import open_env
+
+                    env = open_env(args.ocbench_task)
+                    try:
+                        obs_dim, = env.observation_space.shape
+                        spec['episode_steps'] = args.episode_steps or env.spec.max_episode_steps
+                        action_bounds = dict(low=tuple(map(float, env.action_space.low)),
+                                             high=tuple(map(float, env.action_space.high)))
+                    finally:
+                        env.close()
+                    spec['ocbench_task'] = args.ocbench_task
+                    spec['ocbench_shards'] = args.ocbench_shards
+                    fdim, actions = obs_dim + 1, 2
+                    feature_low = (-1.,) * obs_dim + (0.,)
+                    feature_high = (1.,) * fdim
+                else:
+                    experiment = make_experiment(args.environment, args.seed, teacher_count=0, branching=args.branching)
+                    obs_dim = experiment['anchors'].shape[1]
+                    fdim = obs_dim if args.features in ('state', 'rbf') else experiment['feature_dim']
+                    actions = 2 if continuous else experiment['space'].n
+                    feature_low = ((-1., 0.) if args.features == 'state' else (-1., -1., 0., 0.)) if continuous else None
+                    feature_high = (1.,) * fdim if continuous else None
                 c = Config(obs_dim, fdim, actions=actions,
                            tilt=Config.tilt if args.tilt is None else args.tilt,
                            uniform_mix=Config.uniform_mix if args.uniform_mix is None else args.uniform_mix,
@@ -156,10 +209,14 @@ def main():
                            action_kind='continuous' if continuous else 'discrete', seed=args.seed,
                            batch_size=args.batch_size, ode_steps=args.ode_steps or Config.ode_steps, ode_solver=args.ode_solver or Config.ode_solver, candidates=args.candidates,
                            hidden=8 if args.tiny else 256,down_dims=(8,16,32) if args.tiny else (256,512,1024),
-                           feature_low=((-1.,0.) if args.features=='state' else (-1.,-1.,0.,0.)) if continuous else None,
-                           feature_high=((1.,1.) if args.features=='state' else (1.,1.,1.,1.)) if continuous else None)
+                           feature_low=feature_low, feature_high=feature_high, **action_bounds)
                 learner = Learner(c, device)
-                if args.offline_data:
+                if ocbench:
+                    from .ocbench_adapter import load_ocbench_replay
+
+                    learner.replay = load_ocbench_replay(args.offline_data, args.ocbench_task, args.ocbench_shards)
+                    spec['offline_data'] = str(args.offline_data.resolve()) if args.offline_data else 'OCBench release'
+                elif args.offline_data:
                     from .offline_data import load_replay
                     learner.replay = load_replay(args.offline_data, spec)
                     spec['offline_data'] = str(args.offline_data.resolve())
@@ -167,22 +224,42 @@ def main():
                 parser.error('--rounds is below checkpoint round')
             collect_every = args.collect_every if args.collect_every is not None else spec.get('collect_every', 5)
             spec['collect_every'] = collect_every
-            evaluation_defaults = (('eval_every', 5), ('eval_banks', DEFAULT_BANKS), ('eval_tasks', DEFAULT_TASKS))
+            save_every = args.save_every if args.save_every is not None else spec.get('save_every', 5)
+            spec['save_every'] = save_every
+            evaluation_defaults = (('eval_every', 5), ('eval_banks', DEFAULT_BANKS), ('eval_tasks', 10 if spec['environment'] == 'ocbench' else DEFAULT_TASKS))
             evaluation_overridden = any(getattr(args, key) is not None for key, _ in evaluation_defaults)
             for key, default in evaluation_defaults:
                 value = getattr(args, key)
                 spec[key] = spec.get(key, default) if value is None else value
-            if args.resume:
-                experiment = make_experiment(spec['environment'], spec['seed'], teacher_count=0, branching=spec['branching'])
-            env = experiment['env_factory']()
-            feature = experiment['feature']
-            if spec.get('features','state-action')=='state':
-                feature=(lambda obs,action:np.array([obs[0],obs[0]**2])) if spec['environment']=='continuous' else (lambda obs,action:np.asarray(obs).copy())
-            if spec.get('features') == 'rbf':
-                rbf = fourrooms_rbf_features()
-                feature = lambda obs, action: rbf[obs.argmax()]
-                spec['eval_tasks'] = len(FOURROOMS_GOALS)
-            coverage = spec['environment'] != 'continuous' and spec['method'] == 'coverage'
+            if spec['environment'] != 'ocbench':
+                if args.resume:
+                    experiment = make_experiment(spec['environment'], spec['seed'], teacher_count=0, branching=spec['branching'])
+                env = experiment['env_factory']()
+                feature = experiment['feature']
+                if spec.get('features','state-action')=='state':
+                    feature=(lambda obs,action:np.array([obs[0],obs[0]**2])) if spec['environment']=='continuous' else (lambda obs,action:np.asarray(obs).copy())
+                if spec.get('features') == 'rbf':
+                    rbf = fourrooms_rbf_features()
+                    feature = lambda obs, action: rbf[obs.argmax()]
+                    spec['eval_tasks'] = len(FOURROOMS_GOALS)
+            coverage = spec['environment'] in ('garnet', 'fourrooms') and spec['method'] == 'coverage'
+            if args.wandb_mode != 'disabled':
+                import wandb
+
+                output_path = str(args.output.resolve())
+                previous = spec.get('wandb', {})
+                resume_run = previous.get('output') == output_path and previous.get('project') == args.wandb_project
+                run = wandb.init(
+                    project=args.wandb_project, name=args.output.name, mode=args.wandb_mode,
+                    id=previous['id'] if resume_run else None,
+                    resume='allow' if resume_run and args.wandb_mode == 'online' else None,
+                    config={'training': asdict(learner.config),
+                            'experiment': {key: value for key, value in spec.items() if key != 'wandb'}},
+                )
+                spec['wandb'] = {'id': run.id, 'project': args.wandb_project, 'output': output_path}
+                run.define_metric('round')
+                run.define_metric('train/*', step_metric='round')
+                run.define_metric('eval/*', step_metric='round')
             if not args.resume:
                 if not spec.get('offline_data'):
                     learner.collect(env, feature, spec['initial_steps'], warmup=True, episode_steps=spec['episode_steps'])
@@ -191,9 +268,11 @@ def main():
                               dynamic_ncols=True, disable=updates == 0):
                     learner.update_tensor(coverage=coverage)
                 save_round(learner, args.output, spec, snapshot=True)
+                if run is not None:
+                    upload_checkpoint(run, args.output, learner.round)
             resuming_latest = args.resume and args.resume.resolve() == (args.output / 'checkpoint.npz').resolve()
             evaluate_round(learner, args.output, spec, args.rounds,
-                           skip_completed=resuming_latest and not evaluation_overridden)
+                           skip_completed=resuming_latest and not evaluation_overridden, run=run)
             while learner.round < args.rounds:
                 next_round = learner.round + 1
                 collected_steps = 0
@@ -206,11 +285,20 @@ def main():
                 row = dict(round=learner.round, transitions=learner.replay.size, env_steps=learner.env_steps,
                            collected_steps=collected_steps, flow_loss=flow_loss, readout_loss=readout_loss)
                 learner.history.append(row)
-                save_round(learner, args.output, spec, snapshot=learner.round % 5 == 0 or learner.round == args.rounds)
+                snapshot = learner.round == args.rounds or (save_every > 0 and learner.round % save_every == 0)
+                publish = run is not None and learner.round % WANDB_CHECKPOINT_EVERY == 0
+                save_round(learner, args.output, spec, snapshot=snapshot or publish)
                 print(json.dumps(row), flush=True)
-                evaluate_round(learner, args.output, spec, args.rounds)
+                if run is not None:
+                    run.log({'round': learner.round, **{f'train/{key}': value
+                                                        for key, value in row.items() if key != 'round'}})
+                    if publish:
+                        upload_checkpoint(run, args.output, learner.round)
+                evaluate_round(learner, args.output, spec, args.rounds, run=run)
         finally:
             lock.unlink()
+            if run is not None:
+                run.finish()
 
 
 if __name__ == '__main__':

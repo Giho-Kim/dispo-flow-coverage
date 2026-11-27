@@ -19,12 +19,16 @@ def evaluate(path, banks=DEFAULT_BANKS, candidates=None, tasks=DEFAULT_TASKS, se
 
 @torch.no_grad()
 def evaluate_learner(learner, spec, banks=DEFAULT_BANKS, candidates=None, tasks=DEFAULT_TASKS, seed=93281):
-    if spec is None or spec['environment'] not in ('garnet', 'fourrooms'):
-        raise ValueError('The Markov reward process evaluator requires a Garnet or Four Rooms checkpoint')
+    if spec is None or spec['environment'] not in ('garnet', 'fourrooms', 'ocbench'):
+        raise ValueError('The Markov reward process evaluator requires a Garnet, Four Rooms, or OCBench checkpoint')
     config = learner.config
     candidates = config.candidates if candidates is None else candidates
     if min(banks, tasks) < 1 or candidates < config.elites:
         raise ValueError('Expected positive banks/tasks and at least as many candidates as elites')
+    if spec['environment'] == 'ocbench':
+        from .ocbench_adapter import evaluate_ocbench
+
+        return evaluate_ocbench(learner, spec, candidates, tasks, seed)
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from environments import make_experiment
     p = make_experiment(spec['environment'], spec['seed'], 0, spec['branching'])['env_factory']()._p

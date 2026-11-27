@@ -1,6 +1,6 @@
 # DiSPO flow matching and coverage-weighted training
 
-Conditional outcome and action generators trained with flow matching, using the DiSPO Bellman target, conditional U-Net architecture, outcome scaling, EMA inference, and elite outcome selection. Coverage reweights training losses by the state and Bellman outcome. Both methods collect with random outcome draws. The implementation supports discrete and bounded continuous actions, accumulating uniform transition replay, full checkpoint resume, and fresh outcome/action generation during evaluation.
+Conditional outcome and action generators trained with flow matching, using the DiSPO Bellman target, conditional U-Net architecture, outcome scaling, EMA inference, and elite outcome selection. Coverage uses the state and Bellman outcome to weight or select examples for the action readout. Both methods collect with random outcome draws. The implementation supports discrete and bounded continuous actions, accumulating uniform transition replay, full checkpoint resume, and fresh outcome/action generation during evaluation.
 
 See [implementation and commands](shared_readout/dispo_fm/README.md).
 
@@ -9,6 +9,7 @@ See [implementation and commands](shared_readout/dispo_fm/README.md).
 ```bash
 conda env create -f environment.yml
 conda activate dispo-fm-gpu
+wandb login
 python shared_readout/run.py train --device cuda --output shared_readout/fm_v3_results/coverage --method coverage --rounds 100
 ```
 
@@ -19,6 +20,10 @@ Garnet training runs evaluation every five rounds and at the final round. The tr
 ```bash
 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python -m unittest shared_readout.dispo_fm.test_core -v
 ```
+
+## OCBench GPU
+
+See [OCBench Block Lite on GPU](shared_readout/dispo_fm/README.md#ocbench-block-lite-on-gpu) for installation and training with CUDA and parallel MJWarp evaluation.
 
 ## Reference
 
