@@ -55,7 +55,7 @@ class Flow:
         self.solver = None
 
     @torch.no_grad()
-    def sample(self, context, rng, count=None):
+    def sample(self, context, rng, count=None, guidance=None):
         solver = (self.config.ode_solver, self.config.ode_steps, self.outcome and self.config.outcome_simplex,
                   self.outcome and self.config.outcome_step_clip)
         if self.solver != solver:
@@ -66,6 +66,8 @@ class Flow:
             self.time_embeddings = self.ema.time_embedding(time_grid / self.solver_steps).split(1)
         x = torch.randn((len(context) if count is None else count, self.dimension),
                         device=context.device, dtype=context.dtype, generator=rng)
+        if guidance is not None:
+            return self._integrate(x, context, guidance)
         # Collection and bootstrap use fixed shapes. Keep graph memory bounded for other callers.
         key = (len(context), len(x))
         bootstrap = len(context) == len(x) == self.config.batch_size
@@ -98,10 +100,23 @@ class Flow:
                 result = self._integrate(static_x, static_context)
         return graph, static_x, static_context, result
 
-    def _integrate(self, x, context):
+    def _integrate(self, x, context, guidance=None):
         # A single context can condition a whole bank without repeated embedding/FiLM work.
         dt = 1 / self.solver_steps
         context_embedding = self.ema.context_embedding(context)
+        if guidance is not None:
+            # A score shift t*g induces the velocity shift (1-t)*g for
+            # x_t = (1-t)*noise + t*outcome, including the limit at t=0.
+            for step, embedding in enumerate(self.time_embeddings[:-1]):
+                remaining = (self.solver_steps - step) * dt
+                v = self.ema.velocity(x, embedding, context_embedding) + remaining * guidance
+                predicted = x + dt * v
+                if self.solver[0] == 'heun':
+                    next_v = self.ema.velocity(predicted, self.time_embeddings[step + 1], context_embedding)
+                    next_v = next_v + (remaining - dt) * guidance
+                    predicted = x + .5 * dt * (v + next_v)
+                x = predicted
+            return self.lower + (x.clamp(-1, 1) + 1) * .5 * self.span
         if self.solver[3]:
             def clipped_velocity(value, embedding, remaining):
                 velocity = self.ema.velocity(value, embedding, context_embedding)
@@ -358,10 +373,16 @@ class Learner:
         mix = self.config.uniform_mix
         return ((1 - mix) * weights + mix / len(weights)).to(self.dtype)
 
-    def update_tensor(self, coverage=False):
+    def update_tensor(self, coverage=False, indices=None):
         c = self.config
         pool_size = c.batch_size * (c.goal_pool_multiplier if coverage else 1)
-        batch = {key: self.tensor(value) for key, value in self.replay.sample(pool_size, self.rng).items()
+        if indices is None:
+            samples = self.replay.sample(pool_size, self.rng)
+        else:
+            if len(indices) != pool_size:
+                raise ValueError('Batch indices must match the training pool size')
+            samples = {key: values[indices] for key, values in self.replay.arrays.items()}
+        batch = {key: self.tensor(value) for key, value in samples.items()
                  if key != 'truncated'}
         # Draw the detached bootstrap once and share the physical target between models.
         successors = self.flow.sample(batch['next_observations'], self.model_rng)

@@ -12,6 +12,7 @@ from tqdm import tqdm
 from .core import Config, Learner, resolve_device
 from .evaluate import DEFAULT_BANKS, DEFAULT_TASKS, evaluate_learner, save_evaluation
 from .ocbench_adapter import DEFAULT_TASK as DEFAULT_OCBENCH_TASK
+from .ogbench_adapter import DATASETS, EVAL_UPDATES, TRAIN_UPDATES, epoch_batches
 
 
 def save_round(learner, output, spec, snapshot=False):
@@ -42,13 +43,19 @@ def evaluate_round(learner, output, spec, final_round, *, skip_completed=False, 
     current = learner.round
     if not every or spec['environment'] == 'continuous':
         return
-    if current != final_round and (current == 0 or current % every):
+    ogbench = spec['environment'] == 'ogbench'
+    if ogbench:
+        if not learner.flow.steps or learner.flow.steps % (every * spec['updates_per_round']):
+            return
+    elif current != final_round and (current == 0 or current % every):
         return
     destination = output / 'evaluation' / f'round{current:03d}'
     if skip_completed and all((destination / name).is_file() for name in ('summary.json', 'evaluation.npz')):
         return
     banks, tasks, candidates = spec['eval_banks'], spec['eval_tasks'], learner.config.candidates
-    details = (dict(horizon=spec['episode_steps']) if spec['environment'] in ('fourrooms', 'ocbench') else dict(banks=banks))
+    if ogbench:
+        candidates = 1
+    details = (dict(horizon=spec['episode_steps']) if spec['environment'] in ('fourrooms', 'ocbench', 'ogbench') else dict(banks=banks))
     print(json.dumps(dict(event='eval_start', round=current, tasks=tasks, candidates=candidates, **details)), flush=True)
     row, arrays = evaluate_learner(learner, spec, banks=banks, candidates=candidates, tasks=tasks)
     summary = save_evaluation(destination, row, arrays, banks=banks, candidates=candidates, tasks=tasks, config=learner.config)
@@ -68,7 +75,8 @@ def main():
                         default=os.environ.get('WANDB_MODE', 'online'))
     parser.add_argument('--resume', type=Path)
     parser.add_argument('--offline-data', type=Path, help='Local offline replay dataset; disables online collection')
-    parser.add_argument('--environment', choices=['garnet', 'fourrooms', 'continuous', 'ocbench'], default='garnet')
+    parser.add_argument('--environment', choices=['garnet', 'fourrooms', 'continuous', 'ocbench', 'ogbench'], default='garnet')
+    parser.add_argument('--ogbench-dataset', choices=DATASETS, default=DATASETS[0])
     parser.add_argument('--ocbench-task', default=DEFAULT_OCBENCH_TASK)
     parser.add_argument('--ocbench-shards', type=int, default=1)
     parser.add_argument('--branching', type=int, choices=[1, 2], default=1)
@@ -82,28 +90,38 @@ def main():
     parser.add_argument('--goal-pool-multiplier', type=int, help='Coverage readout: 1 weights losses; N > 1 selects a batch without replacement from N batches of goals')
     parser.add_argument('--coverage-weighting', choices=['linear', 'power'], help='Coverage normalization (default: linear; resume preserves saved value)')
     parser.add_argument('--gram-ema-rate', type=float, help='Gram EMA decay (default: 0.995; resume preserves saved value)')
-    parser.add_argument('--rounds', type=int, default=100)
+    parser.add_argument('--rounds', type=int)
     parser.add_argument('--initial-steps', type=int, default=4096)
-    parser.add_argument('--pretrain-updates', type=int, default=3000)
+    parser.add_argument('--pretrain-updates', type=int)
     parser.add_argument('--steps-per-round', type=int, default=1024, help='Environment steps per collection round')
     parser.add_argument('--collect-every', type=int, help='Rounds between online collections (default: 5)')
-    parser.add_argument('--updates-per-round', type=int, default=128)
+    parser.add_argument('--updates-per-round', type=int)
     parser.add_argument('--episode-steps', type=int)
     parser.add_argument('--batch-size', type=int, default=2048)
     parser.add_argument('--ode-steps', type=int, help=f'ODE steps (default: {Config.ode_steps})')
     parser.add_argument('--ode-solver', choices=['heun', 'euler'], help=f'ODE solver (default: {Config.ode_solver})')
     parser.add_argument('--candidates', type=int, default=1000)
     parser.add_argument('--save-every', type=int, help='Rounds between checkpoint snapshots (default: 5; 0 keeps only initial and final snapshots)')
-    parser.add_argument('--eval-every', type=int, help='Garnet rounds between evaluations (default: 5, 0 disables)')
+    parser.add_argument('--eval-every', type=int, help='Rounds between evaluations (OGBench: 1, Garnet: 5; 0 disables)')
     parser.add_argument('--eval-banks', type=int, help=f'Banks per state for Garnet evaluation (default: {DEFAULT_BANKS})')
-    parser.add_argument('--eval-tasks', type=int, help=f'Garnet evaluation reward tasks (default: {DEFAULT_TASKS})')
+    parser.add_argument('--eval-tasks', type=int, help='Evaluation reward tasks or rollout episodes')
     parser.add_argument('--device', default='auto', help='auto, cpu, cuda, or cuda:N')
     parser.add_argument('--tiny', action='store_true', help='Small network for smoke tests only')
     args = parser.parse_args()
+    if args.batch_size < 1:
+        parser.error('--batch-size must be positive')
+    new_ogbench = not args.resume and args.environment == 'ogbench'
+    if args.pretrain_updates is None:
+        args.pretrain_updates = 0 if new_ogbench else 3000
+    if args.updates_per_round is None:
+        args.updates_per_round = EVAL_UPDATES if new_ogbench else 128
     if args.train_seed is not None and (args.train_seed < 0 or args.resume):
         parser.error('--train-seed must be nonnegative and is only for new runs')
     if args.method is None:
-        args.method = 'uniform' if args.environment == 'ocbench' else 'coverage'
+        args.method = 'uniform' if args.environment in ('ocbench', 'ogbench') else 'coverage'
+    if new_ogbench:
+        if args.method != 'uniform' or args.features != 'state' or args.offline_data or args.pretrain_updates:
+            parser.error('OGBench uses official offline datasets, uniform batches, state features and no separate pretraining')
     if not args.resume and args.environment == 'ocbench':
         if args.method != 'uniform' or args.features != 'state':
             parser.error('OCBench currently requires --method uniform --features state')
@@ -114,7 +132,7 @@ def main():
         parser.error('--features rbf requires Four Rooms')
     if args.resume and args.offline_data:
         parser.error('Resume restores its replay; use --offline-data for a new run')
-    if args.episode_steps is None and args.environment != 'ocbench':
+    if args.episode_steps is None and args.environment not in ('ocbench', 'ogbench'):
         args.episode_steps = 64
     for key in ('rounds', 'initial_steps', 'pretrain_updates', 'steps_per_round', 'updates_per_round', 'episode_steps'):
         if getattr(args, key) is not None and getattr(args, key) < (0 if key in ('rounds', 'pretrain_updates') else 1):
@@ -175,10 +193,11 @@ def main():
                 spec = {k: getattr(args, k) for k in ('environment', 'branching', 'features', 'seed', 'method', 'initial_steps',
                         'pretrain_updates', 'steps_per_round', 'updates_per_round', 'episode_steps')}
                 ocbench = args.environment == 'ocbench'
-                continuous = args.environment in ('continuous', 'ocbench')
+                continuous = args.environment in ('continuous', 'ocbench', 'ogbench')
+                total_updates = Config.total_updates
                 action_bounds = {}
                 if ocbench:
-                    from .ocbench_adapter import open_env
+                    from .ocbench_adapter import load_ocbench_replay, open_env
 
                     env = open_env(args.ocbench_task)
                     try:
@@ -190,9 +209,38 @@ def main():
                         env.close()
                     spec['ocbench_task'] = args.ocbench_task
                     spec['ocbench_shards'] = args.ocbench_shards
-                    fdim, actions = obs_dim + 1, 2
-                    feature_low = (-1.,) * obs_dim + (0.,)
-                    feature_high = (1.,) * fdim
+                    replay, spec['ocbench_reward_weights'] = load_ocbench_replay(
+                        args.offline_data, args.ocbench_task, args.ocbench_shards, device)
+                    spec['ocbench_feature_map'] = 'dispo-fourier'
+                    spec['offline_data'] = str(args.offline_data.resolve()) if args.offline_data else 'OCBench release'
+                    features = replay.arrays['features']
+                    fdim, actions = features.shape[1], 2
+                    feature_low = tuple(map(float, features.min(axis=0)[:-1])) + (0.,)
+                    feature_high = tuple(map(float, features.max(axis=0)[:-1])) + (1.,)
+                elif new_ogbench:
+                    from .ogbench_adapter import load_replay, open_env
+
+                    dataset = args.ogbench_dataset
+                    env = open_env(dataset)
+                    try:
+                        obs_dim, = env.observation_space.shape
+                        spec['episode_steps'] = args.episode_steps or env.spec.max_episode_steps
+                        action_bounds = dict(low=tuple(map(float, env.action_space.low)),
+                                             high=tuple(map(float, env.action_space.high)))
+                    finally:
+                        env.close()
+                    print(f'Loading OGBench training data and Fourier features: {dataset}', flush=True)
+                    replay = load_replay(dataset, device)
+                    spec.update(ogbench_dataset=dataset, offline_data='OGBench release')
+                    steps_per_epoch = replay.size // args.batch_size
+                    if not 0 < steps_per_epoch <= TRAIN_UPDATES:
+                        parser.error('Batch size must yield between 1 and 100000 updates per epoch')
+                    total_updates = TRAIN_UPDATES // steps_per_epoch * steps_per_epoch
+                    spec.update(steps_per_epoch=steps_per_epoch, default_updates=total_updates)
+                    features = replay.arrays['features']
+                    fdim, actions = features.shape[1], 2
+                    feature_low = tuple(map(float, features.min(axis=0)[:-1])) + (0.,)
+                    feature_high = tuple(map(float, features.max(axis=0)[:-1])) + (1.,)
                 else:
                     experiment = make_experiment(args.environment, args.seed, teacher_count=0, branching=args.branching)
                     obs_dim = experiment['anchors'].shape[1]
@@ -213,29 +261,39 @@ def main():
                            seed=args.seed if args.train_seed is None else args.train_seed,
                            batch_size=args.batch_size, ode_steps=args.ode_steps or Config.ode_steps, ode_solver=args.ode_solver or Config.ode_solver, candidates=args.candidates,
                            hidden=8 if args.tiny else 256,down_dims=(8,16,32) if args.tiny else (256,512,1024),
-                           feature_low=feature_low, feature_high=feature_high, **action_bounds)
+                           feature_low=feature_low, feature_high=feature_high, total_updates=total_updates, **action_bounds)
                 learner = Learner(c, device)
-                if ocbench:
-                    from .ocbench_adapter import load_ocbench_replay
-
-                    learner.replay = load_ocbench_replay(args.offline_data, args.ocbench_task, args.ocbench_shards)
-                    spec['offline_data'] = str(args.offline_data.resolve()) if args.offline_data else 'OCBench release'
+                if ocbench or new_ogbench:
+                    learner.replay = replay
                 elif args.offline_data:
                     from .offline_data import load_replay
                     learner.replay = load_replay(args.offline_data, spec)
                     spec['offline_data'] = str(args.offline_data.resolve())
-            if args.rounds < learner.round:
+            ogbench = spec['environment'] == 'ogbench'
+            if ogbench:
+                updates_per_round = spec['updates_per_round']
+                if args.rounds is None:
+                    target_updates = spec['default_updates']
+                    args.rounds = (target_updates + updates_per_round - 1) // updates_per_round
+                else:
+                    target_updates = args.rounds * updates_per_round
+                batches = epoch_batches(learner.replay.size, learner.config.batch_size,
+                                        learner.config.seed, learner.flow.steps)
+            elif args.rounds is None:
+                args.rounds = 100
+            if args.rounds < learner.round or (ogbench and target_updates < learner.flow.steps):
                 parser.error('--rounds is below checkpoint round')
             collect_every = args.collect_every if args.collect_every is not None else spec.get('collect_every', 5)
             spec['collect_every'] = collect_every
-            save_every = args.save_every if args.save_every is not None else spec.get('save_every', 5)
+            save_every = args.save_every if args.save_every is not None else spec.get('save_every', 0 if ogbench else 5)
             spec['save_every'] = save_every
-            evaluation_defaults = (('eval_every', 5), ('eval_banks', DEFAULT_BANKS), ('eval_tasks', 10 if spec['environment'] == 'ocbench' else DEFAULT_TASKS))
+            evaluation_defaults = (('eval_every', 1 if ogbench else 5), ('eval_banks', DEFAULT_BANKS),
+                                   ('eval_tasks', 1 if ogbench else 10 if spec['environment'] == 'ocbench' else DEFAULT_TASKS))
             evaluation_overridden = any(getattr(args, key) is not None for key, _ in evaluation_defaults)
             for key, default in evaluation_defaults:
                 value = getattr(args, key)
                 spec[key] = spec.get(key, default) if value is None else value
-            if spec['environment'] != 'ocbench':
+            if spec['environment'] not in ('ocbench', 'ogbench'):
                 if args.resume:
                     experiment = make_experiment(spec['environment'], spec['seed'], teacher_count=0, branching=spec['branching'])
                 env = experiment['env_factory']()
@@ -277,17 +335,29 @@ def main():
             resuming_latest = args.resume and args.resume.resolve() == (args.output / 'checkpoint.npz').resolve()
             evaluate_round(learner, args.output, spec, args.rounds,
                            skip_completed=resuming_latest and not evaluation_overridden, run=run)
-            while learner.round < args.rounds:
+            while (learner.flow.steps < target_updates if ogbench else learner.round < args.rounds):
                 next_round = learner.round + 1
                 collected_steps = 0
                 if not spec.get('offline_data') and next_round % collect_every == 0:
                     collected_steps = spec['steps_per_round']
                     learner.collect(env, feature, collected_steps, method='uniform', episode_steps=spec['episode_steps'])
-                losses = [learner.update_tensor(coverage=coverage) for _ in range(spec['updates_per_round'])]
+                if ogbench:
+                    updates = min(updates_per_round - learner.flow.steps % updates_per_round,
+                                  target_updates - learner.flow.steps)
+                    losses = []
+                    with tqdm(total=updates, desc=f'OGBench updates from {learner.flow.steps}', unit='update') as progress:
+                        for _ in range(updates):
+                            losses.append(learner.update_tensor(indices=next(batches)))
+                            progress.update()
+                    learner.round = (learner.flow.steps + updates_per_round - 1) // updates_per_round
+                else:
+                    losses = [learner.update_tensor(coverage=coverage) for _ in range(spec['updates_per_round'])]
+                    learner.round += 1
                 flow_loss, readout_loss = torch.stack(losses).mean(dim=0).tolist()
-                learner.round += 1
                 row = dict(round=learner.round, transitions=learner.replay.size, env_steps=learner.env_steps,
                            collected_steps=collected_steps, flow_loss=flow_loss, readout_loss=readout_loss)
+                if ogbench:
+                    row['updates'] = learner.flow.steps
                 learner.history.append(row)
                 snapshot = learner.round == args.rounds or (save_every > 0 and learner.round % save_every == 0)
                 publish = run is not None and learner.round % WANDB_CHECKPOINT_EVERY == 0

@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from .core import Replay, elite_mean
+from .features import fourier_features
 
 
 DEFAULT_TASK = 'block-cpu-lite-double-task2-v0'
@@ -23,7 +24,7 @@ def open_env(task):
     return env
 
 
-def load_ocbench_replay(path, task, shards):
+def load_ocbench_replay(path, task, shards, device):
     from ocbench.dataset_utils import download_datasets, get_episode_offsets, load_dataset
 
     paths = [path] if path is not None else download_datasets(task, num_shards=shards)[0]
@@ -39,21 +40,22 @@ def load_ocbench_replay(path, task, shards):
     source = np.arange(size) + np.repeat(obs_offsets[:-1] - action_offsets[:-1], lengths)
     obs = np.asarray(data['observations'][source], dtype=np.float32)
     next_obs = np.asarray(data['observations'][source + 1], dtype=np.float32)
-    rewards = np.asarray(data['rewards'], dtype=np.float32).reshape(size, 1)
-    if not np.all((rewards >= 0) & (rewards <= 1)):
-        raise ValueError('Expected binary or bounded OCBench task rewards')
+    rewards = np.asarray(data['rewards'], dtype=np.float32).reshape(size)
+    ids = np.random.default_rng(0).choice(size, min(size, 10_000), replace=False)
+    reward_features = fourier_features(next_obs[ids], device)
+    reward_weights = np.linalg.lstsq(reward_features.astype(np.float64), rewards[ids], rcond=None)[0]
     terminated = np.asarray(data['masks']).reshape(size) == 0
     truncated = np.asarray(data['terminals'], dtype=bool).reshape(size) & ~terminated
     replay = Replay()
     replay.arrays = dict(
         observations=obs, actions=np.asarray(data['actions'], dtype=np.float32),
-        features=np.concatenate((np.tanh(obs), rewards), axis=1),
+        features=fourier_features(obs, device),
         next_observations=next_obs, terminated=terminated, truncated=truncated,
     )
     if not all(np.isfinite(array).all() for array in replay.arrays.values()):
         raise ValueError('OCBench dataset contains nonfinite values')
     replay.size = replay.capacity = size
-    return replay
+    return replay, reward_weights.tolist()
 
 
 @torch.no_grad()
@@ -63,11 +65,14 @@ def evaluate_ocbench(learner, spec, candidates, episodes, seed):
     returns = np.zeros(episodes)
     success = np.zeros(episodes, dtype=bool)
     horizon = spec['episode_steps']
+    # Old checkpoints used the final outcome coordinate as the reward.
+    default_weights = [0.] * (learner.config.feature_dim - 1) + [1.]
+    weights = learner.tensor(spec.get('ocbench_reward_weights', default_weights))
     if '-cpu-' not in task:
-        evaluate_mjwarp(learner, task, candidates, horizon, seed, rng, returns, success)
+        evaluate_mjwarp(learner, task, candidates, horizon, seed, rng, weights, returns, success)
         simulator = 'mjwarp-cuda'
     else:
-        evaluate_cpu(learner, task, candidates, horizon, seed, rng, returns, success)
+        evaluate_cpu(learner, task, candidates, horizon, seed, rng, weights, returns, success)
         simulator = 'mujoco-cpu'
     row = dict(round=learner.round, mean_return=float(returns.mean()),
                success_rate=float(success.mean()), horizon=horizon, simulator=simulator,
@@ -75,7 +80,7 @@ def evaluate_ocbench(learner, spec, candidates, episodes, seed):
     return row, dict(returns=returns, success=success)
 
 
-def evaluate_cpu(learner, task, candidates, horizon, seed, rng, returns, success):
+def evaluate_cpu(learner, task, candidates, horizon, seed, rng, weights, returns, success):
     env = open_env(task)
     try:
         for i in range(len(returns)):
@@ -83,7 +88,7 @@ def evaluate_cpu(learner, task, candidates, horizon, seed, rng, returns, success
             for _ in range(horizon):
                 observation = learner.tensor(state)[None]
                 outcomes = learner.flow.sample(observation, rng, candidates)
-                goal = elite_mean(outcomes, outcomes[:, -1], learner.config.elites)
+                goal = elite_mean(outcomes, outcomes @ weights, learner.config.elites)
                 action = learner._action(observation, goal, rng)
                 state, reward, terminated, truncated, info = env.step(action)
                 returns[i] += reward
@@ -94,7 +99,7 @@ def evaluate_cpu(learner, task, candidates, horizon, seed, rng, returns, success
         env.close()
 
 
-def evaluate_mjwarp(learner, task, candidates, horizon, seed, rng, returns, success):
+def evaluate_mjwarp(learner, task, candidates, horizon, seed, rng, weights, returns, success):
     import ocbench
     import warp as wp
 
@@ -118,7 +123,7 @@ def evaluate_mjwarp(learner, task, candidates, horizon, seed, rng, returns, succ
                     obs = learner.tensor(states[ids])
                     outcomes = learner.flow.sample(obs.repeat_interleave(candidates, dim=0), rng)
                     outcomes = outcomes.reshape(len(ids), candidates, learner.config.feature_dim)
-                    goals = elite_mean(outcomes, outcomes[:, None, :, -1],
+                    goals = elite_mean(outcomes, (outcomes @ weights)[:, None, :],
                                        learner.config.elites).squeeze(1)
                     samples = learner.readout.sample(torch.cat((obs, goals), dim=1), rng)
                     actions[ids] = (low + (samples + 1) * .5 * span).cpu().numpy()

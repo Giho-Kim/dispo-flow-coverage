@@ -7,20 +7,30 @@ import sys
 import numpy as np
 import torch
 from .core import Learner, elite_mean, resolve_device
+from .ogbench_adapter import EVAL_EPISODES
 
 DEFAULT_BANKS = 128
 DEFAULT_TASKS = 128
 
 
-def evaluate(path, banks=DEFAULT_BANKS, candidates=None, tasks=DEFAULT_TASKS, seed=93281, device='cpu'):
+def evaluate(path, banks=DEFAULT_BANKS, candidates=None, tasks=None, seed=93281, device='cpu'):
     learner, spec = Learner.load(path, device)
     return evaluate_learner(learner, spec, banks, candidates, tasks, seed)
 
 
 @torch.no_grad()
-def evaluate_learner(learner, spec, banks=DEFAULT_BANKS, candidates=None, tasks=DEFAULT_TASKS, seed=93281):
-    if spec is None or spec['environment'] not in ('garnet', 'fourrooms', 'ocbench'):
-        raise ValueError('The Markov reward process evaluator requires a Garnet, Four Rooms, or OCBench checkpoint')
+def evaluate_learner(learner, spec, banks=DEFAULT_BANKS, candidates=None, tasks=None, seed=93281):
+    if spec is None or spec['environment'] not in ('garnet', 'fourrooms', 'ocbench', 'ogbench'):
+        raise ValueError('Expected a Garnet, Four Rooms, OCBench, or OGBench checkpoint')
+    ogbench = spec['environment'] == 'ogbench'
+    if tasks is None:
+        tasks = EVAL_EPISODES if ogbench else DEFAULT_TASKS
+    if ogbench:
+        if tasks < 1:
+            raise ValueError('Expected at least one evaluation episode')
+        from .ogbench_adapter import evaluate_antmaze
+
+        return evaluate_antmaze(learner, spec, tasks, seed)
     config = learner.config
     candidates = config.candidates if candidates is None else candidates
     if min(banks, tasks) < 1 or candidates < config.elites:
@@ -105,7 +115,7 @@ def evaluate_learner(learner, spec, banks=DEFAULT_BANKS, candidates=None, tasks=
 
 
 def save_evaluation(output, row, arrays, *, banks, candidates, tasks, config):
-    summary = dict(row, candidates=candidates, tasks=len(arrays['returns']),
+    summary = dict(row, candidates=row.get('candidates', candidates), tasks=len(arrays['returns']),
                    ode_solver=config.ode_solver, ode_steps=config.ode_steps,
                    outcome_simplex=config.outcome_simplex,
                    protocol=row.get('protocol', 'fresh outcome and action generation at every visit; action probabilities estimated by independent draws'))
@@ -128,7 +138,7 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--banks',type=int,default=DEFAULT_BANKS)
     parser.add_argument('--candidates',type=int,default=None)
-    parser.add_argument('--tasks',type=int,default=DEFAULT_TASKS)
+    parser.add_argument('--tasks',type=int,help='Evaluation tasks or episodes; defaults to 10 for AntMaze')
     parser.add_argument('--device', default='auto', help='auto, cpu, cuda, or cuda:N')
     parser.add_argument('--ode-steps', type=int)
     parser.add_argument('--ode-solver', choices=['heun', 'euler'])

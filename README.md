@@ -23,7 +23,7 @@ OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python -m unittest shared_readout.dispo
 
 ## OGBench AntMaze
 
-See [OGBench AntMaze setup](shared_readout/dispo_fm/README.md#ogbench-antmaze) to install OGBench and check the Medium `navigate`, `stitch`, and `explore` datasets.
+See [OGBench AntMaze setup](shared_readout/dispo_fm/README.md#ogbench-antmaze) to train and evaluate DiSPO-FM on the Medium `navigate`, `stitch`, and `explore` datasets.
 
 ## Reference
 

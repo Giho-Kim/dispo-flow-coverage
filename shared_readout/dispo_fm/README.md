@@ -105,5 +105,33 @@ for variant in ('navigate', 'stitch', 'explore'):
 PYTHON
 ```
 
-This verifies the environment and dataset setup. AntMaze training and evaluation
-through `shared_readout/run.py` still require a DiSPO-FM adapter.
+Train DiSPO-FM from the repository root. Set `variant` to `navigate`, `stitch`,
+or `explore`, and run once per variant.
+
+```bash
+variant=navigate
+output="shared_readout/fm_v3_results/ogbench_antmaze_medium_${variant}"
+MUJOCO_GL=egl python shared_readout/run.py train \
+  --environment ogbench --ogbench-dataset "antmaze-medium-${variant}-v0" \
+  --method uniform --device cuda --output "$output"
+
+MUJOCO_GL=egl python -m shared_readout.dispo_fm.evaluate "$output/checkpoint.npz" \
+  --device cuda --output "$output/final_evaluation"
+```
+
+The AntMaze trainer follows the original DiSPO batch protocol: batch size
+2,048, a fresh shuffle each epoch, no replacement within the epoch, and the
+last incomplete batch dropped. OGBench episode boundaries are treated as
+truncations and bootstrap from the last valid next observation. The default
+budget is 100,000 updates rounded down to whole epochs. There is no separate
+pretraining phase. Checkpoint blocks contain up to 5,000 updates and resume
+restores the position within the shuffled epoch.
+
+Automatic evaluation runs one rollout of OGBench goal 1 every 5,000 updates.
+Standalone evaluation runs 10 episodes by default, two per official goal.
+Rollouts follow the original AntMaze dense reward
+`exp(-distance / 20)` and run to the time limit. They also report whether the
+official goal was reached. Reward weights are fitted with 10,000 next
+observations. The FM sampler adapts DiSPO's guided diffusion planner by steering
+one outcome sample with the reward gradient at each environment step and then
+sampling one action with the EMA readout. Euler uses 10 steps by default.
