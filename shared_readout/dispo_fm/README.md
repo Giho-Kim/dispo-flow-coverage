@@ -68,38 +68,42 @@ The default sampler is Euler with 10 steps for both outcome and readout generati
 The tests check finite-difference gradients, outcome bounds and terminal targets, the shared Bellman target, both models and EMA paths, exact checkpoint continuation on the same backend, continuous action bounds, and elite selection.
 Training logs to Weights & Biases by default. Run `wandb login` once on the training machine and use `--wandb-project` or `WANDB_PROJECT` to choose the project (default: `dispo-fm`). Each run logs training and evaluation metrics and publishes the round 0 checkpoint and every 100th round as checkpoint artifacts. `--save-every` controls additional local snapshots. Use `--wandb-mode offline` to queue logs locally or `--wandb-mode disabled` to train without W&B.
 
-## OCBench Block Lite on GPU
+## OGBench AntMaze
 
-From the repository root, create a separate environment from the GPU environment above.
-
-```bash
-conda create -n dispo-ocbench --clone dispo-fm-gpu
-conda activate dispo-ocbench
-python -m pip install 'ocbench[mjwarp]==1.0.2'
-```
-
-For Linux x86-64 with a CUDA 12 driver, install the CUDA 12 build of Warp. This
-was verified on an RTX 3090 with driver 560.35.03.
+Create and activate a separate environment from the GPU environment above.
+If `dispo-ogbench` already exists, activate it directly.
 
 ```bash
-python -m pip install --force-reinstall --no-deps \
-  'https://github.com/NVIDIA/warp/releases/download/v1.19.0/warp_lang-1.19.0+cu12-py3-none-manylinux_2_28_x86_64.whl'
+conda create -n dispo-ogbench --clone dispo-fm-gpu
+conda activate dispo-ogbench
+python -m pip install 'ogbench==1.2.2'
 ```
 
-The command below trains on CUDA and runs five parallel MJWarp evaluation episodes
-on the same GPU. Expect a kernel compilation delay at the first rollout.
-The loader downloads the first official training shard by default
-(`--ocbench-shards` selects more). Task planning uses bounded state features plus
-the transition reward. OCBench supports uniform training and reports mean return
-and success rate. A task ID with `-cpu-` selects CPU MuJoCo for rollouts.
+The smoke check loads the official training and validation sets for the three
+AntMaze Medium variants and steps MuJoCo once for each of the five evaluation
+goals. OGBench downloads missing datasets to `~/.ogbench/data`. Compact dataset
+row counts include episode endpoints.
 
 ```bash
-wandb login
-MUJOCO_GL=egl python shared_readout/run.py train --environment ocbench \
-  --ocbench-task block-lite-double-task2-v0 --device cuda \
-  --output shared_readout/fm_v3_results/ocbench_block_double_uniform \
-  --batch-size 256 --pretrain-updates 0 --rounds 100 \
-  --candidates 128 --eval-tasks 5 --eval-every 10 --save-every 100
+MUJOCO_GL=egl python - <<'PYTHON'
+import numpy as np
+import ogbench
+
+for variant in ('navigate', 'stitch', 'explore'):
+    name = f'antmaze-medium-{variant}-v0'
+    env, train, val = ogbench.make_env_and_datasets(name, compact_dataset=True)
+    try:
+        num_goals = len(env.unwrapped.task_infos)
+        action = np.zeros(env.action_space.shape, dtype=env.action_space.dtype)
+        for task_id in range(1, num_goals + 1):
+            env.reset(seed=0, options={'task_id': task_id})
+            env.step(action)
+        print(name, len(train['observations']), len(val['observations']), num_goals)
+    finally:
+        env.close()
+        del train, val
+PYTHON
 ```
 
-Use `--wandb-mode disabled` if you do not want to upload logs and checkpoints.
+This verifies the environment and dataset setup. AntMaze training and evaluation
+through `shared_readout/run.py` still require a DiSPO-FM adapter.

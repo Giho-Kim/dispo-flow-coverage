@@ -21,9 +21,9 @@ Garnet training runs evaluation every five rounds and at the final round. The tr
 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python -m unittest shared_readout.dispo_fm.test_core -v
 ```
 
-## OCBench GPU
+## OGBench AntMaze
 
-See [OCBench Block Lite on GPU](shared_readout/dispo_fm/README.md#ocbench-block-lite-on-gpu) for installation and training with CUDA and parallel MJWarp evaluation.
+See [OGBench AntMaze setup](shared_readout/dispo_fm/README.md#ogbench-antmaze) to install OGBench and check the Medium `navigate`, `stitch`, and `explore` datasets.
 
 ## Reference
 
