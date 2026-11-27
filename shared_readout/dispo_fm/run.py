@@ -74,6 +74,7 @@ def main():
     parser.add_argument('--branching', type=int, choices=[1, 2], default=1)
     parser.add_argument('--features',choices=['state','state-action','rbf'],default='state')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--train-seed', type=int, help='Model and training RNG seed for a new run (defaults to --seed)')
     parser.add_argument('--method', choices=['coverage', 'uniform'],
                         help='Coverage-weighted or uniform training on Garnet')
     parser.add_argument('--tilt', type=float, help=f'Coverage weighting exponent (default: {Config.tilt}; resume preserves saved value)')
@@ -99,6 +100,8 @@ def main():
     parser.add_argument('--device', default='auto', help='auto, cpu, cuda, or cuda:N')
     parser.add_argument('--tiny', action='store_true', help='Small network for smoke tests only')
     args = parser.parse_args()
+    if args.train_seed is not None and (args.train_seed < 0 or args.resume):
+        parser.error('--train-seed must be nonnegative and is only for new runs')
     if args.method is None:
         args.method = 'uniform' if args.environment == 'ocbench' else 'coverage'
     if not args.resume and args.environment == 'ocbench':
@@ -206,7 +209,8 @@ def main():
                            outcome_simplex=args.environment == 'garnet',
                            outcome_step_clip=args.environment == 'fourrooms',
                            coverage_state_rbf=args.environment == 'fourrooms',
-                           action_kind='continuous' if continuous else 'discrete', seed=args.seed,
+                           action_kind='continuous' if continuous else 'discrete',
+                           seed=args.seed if args.train_seed is None else args.train_seed,
                            batch_size=args.batch_size, ode_steps=args.ode_steps or Config.ode_steps, ode_solver=args.ode_solver or Config.ode_solver, candidates=args.candidates,
                            hidden=8 if args.tiny else 256,down_dims=(8,16,32) if args.tiny else (256,512,1024),
                            feature_low=feature_low, feature_high=feature_high, **action_bounds)
