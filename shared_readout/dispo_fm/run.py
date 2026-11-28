@@ -360,7 +360,8 @@ def main():
                     row['updates'] = learner.flow.steps
                 learner.history.append(row)
                 snapshot = learner.round == args.rounds or (save_every > 0 and learner.round % save_every == 0)
-                publish = run is not None and learner.round % WANDB_CHECKPOINT_EVERY == 0
+                publish = run is not None and (
+                    ogbench or learner.round % WANDB_CHECKPOINT_EVERY == 0)
                 save_round(learner, args.output, spec, snapshot=snapshot or publish)
                 print(json.dumps(row), flush=True)
                 if run is not None:

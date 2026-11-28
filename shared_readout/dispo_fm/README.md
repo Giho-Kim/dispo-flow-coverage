@@ -127,6 +127,11 @@ budget is 100,000 updates rounded down to whole epochs. There is no separate
 pretraining phase. Checkpoint blocks contain up to 5,000 updates and resume
 restores the position within the shuffled epoch.
 
+With W&B online logging enabled, every OGBench checkpoint block (5,000 updates
+by default) and the final block are uploaded as checkpoint artifacts, with
+`latest` and round aliases. Each uploaded checkpoint also has a local round
+snapshot.
+
 Automatic evaluation runs one rollout of OGBench goal 1 every 5,000 updates.
 Standalone evaluation runs 10 episodes by default, two per official goal.
 Rollouts follow the original AntMaze dense reward
