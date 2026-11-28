@@ -61,9 +61,12 @@ def evaluate_round(learner, output, spec, final_round, *, skip_completed=False, 
     summary = save_evaluation(destination, row, arrays, banks=banks, candidates=candidates, tasks=tasks, config=learner.config)
     print(json.dumps(dict(event='eval_done', **summary)), flush=True)
     if run is not None:
-        run.log({'round': current, **{f'eval/{key}': row[key]
-                                     for key in ('mean_return', 'mean_regret', 'mean_oracle', 'success_rate')
-                                     if key in row}})
+        metrics = {'round': current, **{f'eval/{key}': row[key]
+                                       for key in ('mean_return', 'mean_regret', 'mean_oracle', 'success_rate')
+                                       if key in row}}
+        metrics.update({f'eval/task{task}_success_rate': value
+                        for task, value in row.get('task_success_rates', {}).items()})
+        run.log(metrics)
 
 
 def main():
@@ -102,8 +105,8 @@ def main():
     parser.add_argument('--ode-steps', type=int, help=f'ODE steps (default: {Config.ode_steps})')
     parser.add_argument('--ode-solver', choices=['heun', 'euler'], help=f'ODE solver (default: {Config.ode_solver})')
     parser.add_argument('--candidates', type=int, default=1000)
-    parser.add_argument('--save-every', type=int, help='Snapshot and W&B interval: updates for OGBench (default: 10000), rounds otherwise (default: 5); 0 saves initial/final snapshots')
-    parser.add_argument('--eval-every', type=int, help='Rounds between evaluations (OGBench: 1, Garnet: 5; 0 disables)')
+    parser.add_argument('--save-every', type=int, help='Snapshot and W&B interval: updates for OGBench (default: 100000), rounds otherwise (default: 5); 0 saves initial/final snapshots')
+    parser.add_argument('--eval-every', type=int, help='Rounds between evaluations (OGBench: 20 = 100000 updates, Garnet: 5; 0 disables)')
     parser.add_argument('--eval-banks', type=int, help=f'Banks per state for Garnet evaluation (default: {DEFAULT_BANKS})')
     parser.add_argument('--eval-tasks', type=int, help='Evaluation reward tasks or rollout episodes')
     parser.add_argument('--device', default='auto', help='auto, cpu, cuda, or cuda:N')
@@ -290,10 +293,10 @@ def main():
                 parser.error('--rounds is below checkpoint round')
             collect_every = args.collect_every if args.collect_every is not None else spec.get('collect_every', 5)
             spec['collect_every'] = collect_every
-            save_every = args.save_every if args.save_every is not None else spec.get('save_every', 10000 if ogbench else 5)
+            save_every = args.save_every if args.save_every is not None else spec.get('save_every', 100000 if ogbench else 5)
             spec['save_every'] = save_every
-            evaluation_defaults = (('eval_every', 1 if ogbench else 5), ('eval_banks', DEFAULT_BANKS),
-                                   ('eval_tasks', 1 if ogbench else 10 if spec['environment'] == 'ocbench' else DEFAULT_TASKS))
+            evaluation_defaults = (('eval_every', 20 if ogbench else 5), ('eval_banks', DEFAULT_BANKS),
+                                   ('eval_tasks', 250 if ogbench else 10 if spec['environment'] == 'ocbench' else DEFAULT_TASKS))
             evaluation_overridden = any(getattr(args, key) is not None for key, _ in evaluation_defaults)
             for key, default in evaluation_defaults:
                 value = getattr(args, key)

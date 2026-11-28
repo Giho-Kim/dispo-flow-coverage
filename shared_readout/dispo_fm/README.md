@@ -127,17 +127,29 @@ budget is 100,000 updates rounded down to whole epochs. There is no separate
 pretraining phase. Checkpoint blocks contain up to 5,000 updates and resume
 restores the position within the shuffled epoch.
 
-For OGBench, `--save-every 10000` saves a snapshot and uploads it to W&B
-every 10,000 updates (the default for new runs). The final checkpoint is also
-uploaded with online logging enabled. Checkpoint artifacts have
-`latest` and round aliases. Each uploaded checkpoint also has a local round
-snapshot.
+For OGBench, `--save-every 100000` saves a snapshot and uploads it to W&B
+every 100,000 updates (the default for new runs). The final checkpoint is also
+uploaded with online logging enabled. Artifacts have `latest` and round aliases.
 
-Automatic evaluation runs one rollout of OGBench goal 1 every 5,000 updates.
-Standalone evaluation runs 10 episodes by default, two per official goal.
-Rollouts follow the original AntMaze dense reward
-`exp(-distance / 20)` and run to the time limit. They also report whether the
-official goal was reached. Reward weights are fitted with 10,000 next
-observations. The FM sampler adapts DiSPO's guided diffusion planner by steering
-one outcome sample with the reward gradient at each environment step and then
-sampling one action with the EMA readout. Euler uses 10 steps by default.
+Automatic evaluation defaults to every 20 rounds (100,000 updates).
+Each evaluation runs 250 episodes, 50 for each of the five official tasks,
+with OGBench success termination and the environment time limit. The overall
+score is the mean success rate across tasks. Task success rates, per-episode
+success, lengths, and rewards are saved. Standalone evaluation uses the same
+250-episode default. Inference batches up to 50 episodes on the GPU.
+The EMA guided-FM policy still fits dense AntMaze reward weights from up to
+10,000 next observations and samples one outcome and action at each visit.
+Euler uses 10 steps by default.
+
+To train seeds 0–4 from scratch for 500,000 updates each:
+
+```bash
+for seed in 0 1 2 3 4; do
+  MUJOCO_GL=egl python shared_readout/run.py train \
+    --environment ogbench --ogbench-dataset antmaze-medium-navigate-v0 \
+    --method uniform --device cuda --train-seed "$seed" \
+    --rounds 100 --lr-total-updates 500000 \
+    --eval-every 20 --eval-tasks 250 --save-every 100000 \
+    --output "shared_readout/fm_v3_results/ogbench_antmaze_medium_navigate_500k_seed${seed}" || break
+done
+```

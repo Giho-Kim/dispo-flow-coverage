@@ -138,7 +138,7 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--banks',type=int,default=DEFAULT_BANKS)
     parser.add_argument('--candidates',type=int,default=None)
-    parser.add_argument('--tasks',type=int,help='Evaluation tasks or episodes; defaults to 10 for AntMaze')
+    parser.add_argument('--tasks',type=int,help='Evaluation tasks or episodes; defaults to 250 for AntMaze')
     parser.add_argument('--device', default='auto', help='auto, cpu, cuda, or cuda:N')
     parser.add_argument('--ode-steps', type=int)
     parser.add_argument('--ode-solver', choices=['heun', 'euler'])

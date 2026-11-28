@@ -12,13 +12,13 @@ from .features import fourier_features
 DATASETS = tuple(f'antmaze-medium-{kind}-v0' for kind in ('navigate', 'stitch', 'explore'))
 TRAIN_UPDATES = 100_000
 EVAL_UPDATES = 5_000
-EVAL_EPISODES = 10
+EVAL_EPISODES = 250
 
 
-def open_env(dataset):
+def open_env(dataset, terminate_at_goal=False):
     import ogbench
 
-    return ogbench.make_env_and_datasets(dataset, env_only=True, terminate_at_goal=False)
+    return ogbench.make_env_and_datasets(dataset, env_only=True, terminate_at_goal=terminate_at_goal)
 
 
 def load_replay(dataset, device):
@@ -55,42 +55,80 @@ def epoch_batches(size, batch_size, seed, start=0):
 
 @torch.no_grad()
 def evaluate_antmaze(learner, spec, episodes, seed):
-    env = open_env(spec['ogbench_dataset'])
+    """Official task resets and success termination, with batched FM inference."""
+    from tqdm import tqdm
+
     rng = torch.Generator(device=learner.device).manual_seed(seed)
     returns = np.zeros(episodes)
+    dense_returns = np.zeros(episodes)
     successes = np.zeros(episodes, dtype=bool)
-    goal_ids = 1 + np.arange(episodes) % env.unwrapped.num_tasks
+    lengths = np.zeros(episodes, dtype=np.int32)
+    goal_ids = 1 + np.arange(episodes) % 5
     horizon = spec['episode_steps']
-    try:
-        indices = np.random.default_rng(seed).choice(
-            learner.replay.size, min(10_000, learner.replay.size), replace=False)
-        next_obs = learner.replay.arrays['next_observations'][indices]
-        design = fourier_features(next_obs, learner.device).astype(np.float64)
-        for i, task_id in enumerate(goal_ids):
-            # The official reset also uses NumPy's legacy global RNG for XY jitter.
-            state = np.random.get_state()
+    indices = np.random.default_rng(seed).choice(
+        learner.replay.size, min(10_000, learner.replay.size), replace=False)
+    next_obs = learner.replay.arrays['next_observations'][indices]
+    design = fourier_features(next_obs, learner.device).astype(np.float64)
+    # The regression design is shared across all episode goals.
+    inverse_design = np.linalg.pinv(design)
+    with tqdm(total=episodes, desc='OGBench evaluation', unit='episode') as progress:
+        for start in range(0, episodes, 50):
+            stop = min(start + 50, episodes)
+            environments, observations, goals = [], [], []
             try:
-                np.random.seed((seed + i) % (2**32))
-                env.action_space.seed(seed + i)
-                obs, _ = env.reset(seed=seed + i, options={'task_id': int(task_id)})
+                for i in range(start, stop):
+                    env = open_env(spec['ogbench_dataset'], terminate_at_goal=True)
+                    environments.append(env)
+                    # OGBench also uses NumPy's global RNG for reset XY jitter.
+                    state = np.random.get_state()
+                    try:
+                        np.random.seed((seed + i) % (2**32))
+                        env.action_space.seed(seed + i)
+                        obs, _ = env.reset(seed=seed + i, options={'task_id': int(goal_ids[i])})
+                    finally:
+                        np.random.set_state(state)
+                    observations.append(obs)
+                    goals.append(env.unwrapped.cur_goal_xy)
+                observations = np.asarray(observations, dtype=np.float32)
+                goals = np.asarray(goals)
+                reward_targets = np.exp(
+                    -np.linalg.norm(next_obs[:, None, :2] - goals[None], axis=2) / 20)
+                weights = learner.tensor((inverse_design @ reward_targets).T)
+                guidance = .5 * weights * learner.flow.span * .5
+                active = np.ones(stop - start, dtype=bool)
+                for _ in range(horizon):
+                    observation = learner.tensor(observations)
+                    outcomes = learner.flow.sample(observation, rng, guidance=guidance)
+                    context = torch.cat((observation, outcomes), dim=1)
+                    normalized = learner.readout.sample(context, rng)
+                    actions = (learner.action_low + (normalized + 1) * .5 * learner.action_span).cpu().numpy()
+                    actions = np.clip(actions, -1, 1)
+                    for j in np.flatnonzero(active):
+                        obs, reward, terminated, truncated, info = environments[j].step(actions[j])
+                        observations[j] = obs
+                        i = start + j
+                        returns[i] += reward
+                        dense_returns[i] += np.exp(-np.linalg.norm(obs[:2] - goals[j]) / 20)
+                        lengths[i] += 1
+                        if terminated or truncated:
+                            successes[i] = bool(info['success'])
+                            active[j] = False
+                            progress.update()
+                    if not active.any():
+                        break
+                # For an explicitly shortened diagnostic horizon, retain the
+                # final step's success value as the official evaluator does.
+                for j in np.flatnonzero(active):
+                    successes[start + j] = bool(environments[j].unwrapped.compute_success())
+                    progress.update()
             finally:
-                np.random.set_state(state)
-            goal = env.unwrapped.cur_goal_xy
-            reward_targets = np.exp(-np.linalg.norm(next_obs[:, :2] - goal, axis=1) / 20)
-            weights = learner.tensor(np.linalg.lstsq(design, reward_targets, rcond=None)[0])
-            guidance = .5 * weights * learner.flow.span * .5
-            for _ in range(horizon):
-                observation = learner.tensor(obs)[None]
-                outcome = learner.flow.sample(observation, rng, guidance=guidance)[0]
-                action = learner._action(observation, outcome, rng)
-                obs, _, terminated, truncated, info = env.step(action)
-                returns[i] += np.exp(-np.linalg.norm(obs[:2] - goal) / 20)
-                successes[i] |= bool(info['success'])
-                if terminated or truncated:
-                    break
-    finally:
-        env.close()
+                for env in environments:
+                    env.close()
+    task_success = {str(task): float(successes[goal_ids == task].mean())
+                    for task in np.unique(goal_ids)}
     row = dict(round=learner.round, updates=learner.flow.steps, mean_return=float(returns.mean()),
-               success_rate=float(successes.mean()), horizon=horizon, candidates=1,
-               protocol='DiSPO-style guided FM rollouts with dense AntMaze reward')
-    return row, dict(returns=returns, success=successes, goal_ids=goal_ids)
+               success_rate=float(np.mean(list(task_success.values()))),
+               task_success_rates=task_success, horizon=horizon, candidates=1,
+               protocol='OGBench official goal resets and success termination; mean success over tasks')
+    return row, dict(returns=returns, dense_returns=dense_returns, success=successes,
+                     goal_ids=goal_ids, lengths=lengths)
