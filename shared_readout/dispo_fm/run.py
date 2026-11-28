@@ -101,7 +101,7 @@ def main():
     parser.add_argument('--ode-steps', type=int, help=f'ODE steps (default: {Config.ode_steps})')
     parser.add_argument('--ode-solver', choices=['heun', 'euler'], help=f'ODE solver (default: {Config.ode_solver})')
     parser.add_argument('--candidates', type=int, default=1000)
-    parser.add_argument('--save-every', type=int, help='Rounds between checkpoint snapshots (default: 5; 0 keeps only initial and final snapshots)')
+    parser.add_argument('--save-every', type=int, help='Snapshot and W&B interval: updates for OGBench (default: 10000), rounds otherwise (default: 5); 0 saves initial/final snapshots')
     parser.add_argument('--eval-every', type=int, help='Rounds between evaluations (OGBench: 1, Garnet: 5; 0 disables)')
     parser.add_argument('--eval-banks', type=int, help=f'Banks per state for Garnet evaluation (default: {DEFAULT_BANKS})')
     parser.add_argument('--eval-tasks', type=int, help='Evaluation reward tasks or rollout episodes')
@@ -285,7 +285,7 @@ def main():
                 parser.error('--rounds is below checkpoint round')
             collect_every = args.collect_every if args.collect_every is not None else spec.get('collect_every', 5)
             spec['collect_every'] = collect_every
-            save_every = args.save_every if args.save_every is not None else spec.get('save_every', 0 if ogbench else 5)
+            save_every = args.save_every if args.save_every is not None else spec.get('save_every', 10000 if ogbench else 5)
             spec['save_every'] = save_every
             evaluation_defaults = (('eval_every', 1 if ogbench else 5), ('eval_banks', DEFAULT_BANKS),
                                    ('eval_tasks', 1 if ogbench else 10 if spec['environment'] == 'ocbench' else DEFAULT_TASKS))
@@ -344,6 +344,8 @@ def main():
                 if ogbench:
                     updates = min(updates_per_round - learner.flow.steps % updates_per_round,
                                   target_updates - learner.flow.steps)
+                    if save_every > 0:
+                        updates = min(updates, save_every - learner.flow.steps % save_every)
                     losses = []
                     with tqdm(total=updates, desc=f'OGBench updates from {learner.flow.steps}', unit='update') as progress:
                         for _ in range(updates):
@@ -359,9 +361,13 @@ def main():
                 if ogbench:
                     row['updates'] = learner.flow.steps
                 learner.history.append(row)
-                snapshot = learner.round == args.rounds or (save_every > 0 and learner.round % save_every == 0)
-                publish = run is not None and (
-                    ogbench or learner.round % WANDB_CHECKPOINT_EVERY == 0)
+                if ogbench:
+                    snapshot = learner.flow.steps == target_updates or (
+                        save_every > 0 and learner.flow.steps % save_every == 0)
+                    publish = run is not None and snapshot
+                else:
+                    snapshot = learner.round == args.rounds or (save_every > 0 and learner.round % save_every == 0)
+                    publish = run is not None and learner.round % WANDB_CHECKPOINT_EVERY == 0
                 save_round(learner, args.output, spec, snapshot=snapshot or publish)
                 print(json.dumps(row), flush=True)
                 if run is not None:

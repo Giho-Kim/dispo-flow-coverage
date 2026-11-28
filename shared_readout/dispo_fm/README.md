@@ -127,8 +127,9 @@ budget is 100,000 updates rounded down to whole epochs. There is no separate
 pretraining phase. Checkpoint blocks contain up to 5,000 updates and resume
 restores the position within the shuffled epoch.
 
-With W&B online logging enabled, every OGBench checkpoint block (5,000 updates
-by default) and the final block are uploaded as checkpoint artifacts, with
+For OGBench, `--save-every 10000` saves a snapshot and uploads it to W&B
+every 10,000 updates (the default for new runs). The final checkpoint is also
+uploaded with online logging enabled. Checkpoint artifacts have
 `latest` and round aliases. Each uploaded checkpoint also has a local round
 snapshot.
 
