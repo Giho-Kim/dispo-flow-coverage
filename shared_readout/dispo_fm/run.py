@@ -98,6 +98,7 @@ def main():
     parser.add_argument('--updates-per-round', type=int)
     parser.add_argument('--episode-steps', type=int)
     parser.add_argument('--batch-size', type=int, default=2048)
+    parser.add_argument('--lr-total-updates', type=int, help='Cosine learning-rate schedule length; overrides the saved schedule on resume')
     parser.add_argument('--ode-steps', type=int, help=f'ODE steps (default: {Config.ode_steps})')
     parser.add_argument('--ode-solver', choices=['heun', 'euler'], help=f'ODE solver (default: {Config.ode_solver})')
     parser.add_argument('--candidates', type=int, default=1000)
@@ -110,6 +111,8 @@ def main():
     args = parser.parse_args()
     if args.batch_size < 1:
         parser.error('--batch-size must be positive')
+    if args.lr_total_updates is not None and args.lr_total_updates < 1:
+        parser.error('--lr-total-updates must be positive')
     new_ogbench = not args.resume and args.environment == 'ogbench'
     if args.pretrain_updates is None:
         args.pretrain_updates = 0 if new_ogbench else 3000
@@ -281,6 +284,8 @@ def main():
                                         learner.config.seed, learner.flow.steps)
             elif args.rounds is None:
                 args.rounds = 100
+            if args.lr_total_updates is not None:
+                learner.config.total_updates = args.lr_total_updates
             if args.rounds < learner.round or (ogbench and target_updates < learner.flow.steps):
                 parser.error('--rounds is below checkpoint round')
             collect_every = args.collect_every if args.collect_every is not None else spec.get('collect_every', 5)
